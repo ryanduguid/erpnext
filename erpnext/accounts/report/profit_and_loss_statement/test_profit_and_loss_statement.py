@@ -1,6 +1,8 @@
 # Copyright (c) 2023, Frappe Technologies Pvt. Ltd. and Contributors
 # MIT License. See license.txt
 
+from unittest.mock import Mock, patch
+
 import frappe
 from frappe.desk.query_report import export_query
 from frappe.utils import add_days, getdate, today
@@ -11,6 +13,7 @@ from erpnext.accounts.report.financial_statements import (
 	get_period_list,
 	is_dimension_grouped,
 )
+from erpnext.accounts.report.profit_and_loss_statement import profit_and_loss_statement as report
 from erpnext.accounts.report.profit_and_loss_statement.profit_and_loss_statement import execute
 from erpnext.accounts.test.accounts_mixin import AccountsTestMixin
 from erpnext.tests.utils import ERPNextTestSuite
@@ -72,6 +75,47 @@ class TestProfitAndLossStatement(ERPNextTestSuite, AccountsTestMixin):
 		cc.company = self.company
 		cc.insert()
 		return cc.name
+
+	def test_snapshot_margin_uses_period_list_with_both_accumulation_modes(self):
+		for accumulated_values in (False, True):
+			with self.subTest(accumulated_values=accumulated_values):
+				filters = frappe._dict(
+					company="_Test Company",
+					periodicity="Monthly",
+					presentation_currency="EUR",
+					selected_view="Margin",
+					accumulated_values=accumulated_values,
+				)
+				period_list = [{"key": "jan"}, {"key": "feb"}]
+				columns = [{"fieldname": "jan"}, {"fieldname": "feb"}]
+				income = [{"account_name": "Income", "jan": 100, "feb": 0}]
+				expense = [{"account_name": "Expense", "jan": 40, "feb": 0}]
+				net_profit = {"account_name": "Net Profit", "jan": 60, "feb": 0}
+				margin_inputs = []
+
+				def margin_view(data, periods):
+					margin_inputs.append((data, periods))
+
+				with (
+					patch("frappe.database.duckdb.database.get_latest_sync", return_value=object()),
+					patch.multiple(
+						report,
+						build_period_list=Mock(return_value=period_list),
+						_get_data_duckdb=Mock(side_effect=[income, expense]),
+						get_net_profit_loss=Mock(return_value=net_profit),
+						get_columns=Mock(return_value=columns),
+						get_chart_data=Mock(return_value={}),
+						get_report_summary=Mock(return_value=([], {})),
+						compute_margin_view_data=margin_view,
+					),
+				):
+					result = report.execute_snapshot_report(filters)
+
+				self.assertEqual(len(margin_inputs), 1)
+				self.assertIs(margin_inputs[0][0], result[1])
+				self.assertEqual(result[1], income + expense + [net_profit])
+				self.assertIs(margin_inputs[0][1], period_list)
+				self.assertIs(result[0], columns)
 
 	def test_group_by_dimension(self):
 		second_cc = self._create_cost_center("P&L Test CC 2")
