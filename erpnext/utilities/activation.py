@@ -67,7 +67,7 @@ def get_level(site_info):
 
 def get_help_messages():
 	"""Returns help messages to be shown on Desktop"""
-	if get_level() > 6:
+	if get_level({})["activation_level"] > 6:
 		return []
 
 	domain = frappe.get_cached_value("Company", erpnext.get_default_company(), "domain")
