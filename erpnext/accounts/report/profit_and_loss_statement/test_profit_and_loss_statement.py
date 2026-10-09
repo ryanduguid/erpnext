@@ -1,6 +1,8 @@
 # Copyright (c) 2023, Frappe Technologies Pvt. Ltd. and Contributors
 # MIT License. See license.txt
 
+from unittest.mock import patch
+
 import frappe
 from frappe.desk.query_report import export_query
 from frappe.utils import add_days, getdate, today
@@ -11,12 +13,141 @@ from erpnext.accounts.report.financial_statements import (
 	get_period_list,
 	is_dimension_grouped,
 )
+from erpnext.accounts.report.profit_and_loss_statement import profit_and_loss_statement as report
 from erpnext.accounts.report.profit_and_loss_statement.profit_and_loss_statement import execute
 from erpnext.accounts.test.accounts_mixin import AccountsTestMixin
 from erpnext.tests.utils import ERPNextTestSuite
 
 
 class TestProfitAndLossStatement(ERPNextTestSuite, AccountsTestMixin):
+	def test_snapshot_margin_uses_period_values(self):
+		periods = [frappe._dict(key="p1"), frappe._dict(key="p2")]
+		for accumulated in (False, True):
+			with self.subTest(accumulated_values=accumulated):
+				income = {"account_name": frappe._("Income"), "p1": 100, "p2": 300 if accumulated else 200}
+				expense = {"account_name": "Expense", "p1": 25, "p2": 125 if accumulated else 100}
+				profit = {"account_name": "Net Profit", "p1": 75, "p2": 175 if accumulated else 100}
+				filters = frappe._dict(
+					company="Snapshot Test",
+					periodicity="Monthly",
+					presentation_currency="AUD",
+					selected_view="Margin",
+					accumulated_values=accumulated,
+				)
+				columns, chart, summary = [], {}, []
+				with (
+					patch("frappe.database.duckdb.database.get_latest_sync", return_value=object()),
+					patch.object(report, "build_period_list", return_value=periods),
+					patch.object(report, "_get_data_duckdb", side_effect=[[income], [expense]]),
+					patch.object(report, "get_net_profit_loss", return_value=profit),
+					patch.object(report, "get_columns", return_value=columns),
+					patch.object(report, "get_chart_data", return_value=chart),
+					patch.object(report, "get_report_summary", return_value=(summary, 0)),
+					patch.object(
+						report, "compute_margin_view_data", wraps=report.compute_margin_view_data
+					) as margin,
+				):
+					result = report.execute_snapshot_report(filters)
+					margin.assert_called_once_with(result[1], periods)
+				self.assertEqual(result, (columns, [income, expense, profit], None, chart, summary, 0))
+				self.assertIs(result[1][0], income)
+				self.assertEqual([income["p1"], income["p2"]], [100, 100])
+				self.assertEqual([expense["p1"], expense["p2"]], [25, 41.67 if accumulated else 50])
+				self.assertEqual([profit["p1"], profit["p2"]], [75, 58.33 if accumulated else 50])
+
+	def test_margin_missing_and_zero_income(self):
+		periods = [frappe._dict(key="p1"), frappe._dict(key="p2")]
+		data = [
+			{"account_name": frappe._("Income"), "p1": 0, "p2": None},
+			{"account_name": "Expense", "p1": 0, "p2": 2},
+			{"account_name": "Net Profit", "p1": 7, "p2": None},
+		]
+		self.assertIsNone(report.compute_margin_view_data(data, periods))
+		self.assertEqual([[row["p1"], row["p2"]] for row in data], [[0, None], [0, None], [None, None]])
+		missing_income = [{"account_name": "Expense", "p1": 25}]
+		self.assertIsNone(report.compute_margin_view_data(missing_income, periods))
+		self.assertEqual(missing_income, [{"account_name": "Expense", "p1": 25}])
+		empty_periods = [{"account_name": frappe._("Income"), "p1": 100}]
+		self.assertIsNone(report.compute_margin_view_data(empty_periods, []))
+		self.assertEqual(empty_periods, [{"account_name": frappe._("Income"), "p1": 100}])
+
+	def test_snapshot_net_profit_total_uses_accumulated_period_keys(self):
+		cases = (
+			(False, False, [100, 200], [25, 100], 175),
+			(False, True, [100, 300], [25, 125], 175),
+			(True, False, [100, 200, 200, 400], [25, 100, 50, 150], 575),
+			(True, True, [100, 300, 200, 600], [25, 125, 50, 300], 475),
+		)
+		for dimension, accumulated, income_values, expense_values, expected_total in cases:
+			with self.subTest(dimension=dimension, accumulated_values=accumulated):
+				periods = [frappe._dict(key=f"p{i}", label=f"P{i}") for i in range(len(income_values))]
+				if dimension:
+					for i, period in enumerate(periods):
+						period.update(dimension_field="cost_center", dimension_value="A" if i < 2 else "B")
+				income = {period.key: value for period, value in zip(periods, income_values, strict=True)}
+				expense = {period.key: value for period, value in zip(periods, expense_values, strict=True)}
+				income_rows = [{"account_name": frappe._("Income"), **income}, income.copy(), {}]
+				expense_rows = [{"account_name": "Expense", **expense}, expense.copy(), {}]
+				filters = frappe._dict(
+					company="Snapshot Test",
+					periodicity="Monthly",
+					presentation_currency="AUD",
+					selected_view="Report",
+					accumulated_values=accumulated,
+				)
+				with (
+					patch("frappe.database.duckdb.database.get_latest_sync", return_value=object()),
+					patch.object(report, "build_period_list", return_value=periods),
+					patch.object(report, "_get_data_duckdb", side_effect=[income_rows, expense_rows]),
+					patch.object(report, "get_chart_data", return_value={}),
+					patch.object(report, "get_report_summary", return_value=([], 0)),
+				):
+					result = report.execute_snapshot_report(filters)
+				self.assertEqual(result[1][-1]["total"], expected_total)
+
+	def test_snapshot_special_views_omit_total_column(self):
+		for dimension, accumulated in ((False, False), (True, True)):
+			for view in ("Report", "Margin", "Growth"):
+				with self.subTest(dimension=dimension, selected_view=view):
+					income_values = [100, 300, 200, 600] if dimension else [100, 200]
+					expense_values = [25, 125, 50, 300] if dimension else [25, 100]
+					periods = [frappe._dict(key=f"p{i}", label=f"P{i}") for i in range(len(income_values))]
+					if dimension:
+						for i, period in enumerate(periods):
+							period.update(
+								dimension_field="cost_center", dimension_value="A" if i < 2 else "B"
+							)
+					income = {period.key: value for period, value in zip(periods, income_values, strict=True)}
+					expense = {
+						period.key: value for period, value in zip(periods, expense_values, strict=True)
+					}
+					income_rows = [{"account_name": frappe._("Income"), **income}, income.copy(), {}]
+					expense_rows = [{"account_name": "Expense", **expense}, expense.copy(), {}]
+					filters = frappe._dict(
+						company="Snapshot Test",
+						periodicity="Monthly",
+						presentation_currency="AUD",
+						selected_view=view,
+						accumulated_values=accumulated,
+					)
+					with (
+						patch("frappe.database.duckdb.database.get_latest_sync", return_value=object()),
+						patch.object(report, "build_period_list", return_value=periods),
+						patch.object(report, "_get_data_duckdb", side_effect=[income_rows, expense_rows]),
+						patch.object(report, "get_chart_data", return_value={}),
+						patch.object(report, "get_report_summary", return_value=([], 0)),
+						patch.object(report, "compute_growth_view_data"),
+					):
+						result = report.execute_snapshot_report(filters)
+					self.assertEqual(result[0][0]["fieldname"], "account")
+					self.assertEqual(
+						"total" in {column["fieldname"] for column in result[0]}, view == "Report"
+					)
+					self.assertEqual(result[1][-1]["total"], 475 if dimension else 175)
+					if view == "Margin":
+						self.assertEqual(result[1][0]["p0"], 100)
+						self.assertEqual(result[1][-1]["p0"], 75)
+
 	def setUp(self):
 		self.company = "_Test Company"
 		self.customer = "_Test Customer"

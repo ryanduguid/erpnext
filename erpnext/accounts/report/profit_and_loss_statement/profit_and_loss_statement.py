@@ -235,7 +235,12 @@ def execute_snapshot_report(filters):
 	expense = _get_data_duckdb(conn, filters, "Expense", "Debit", period_list)
 
 	net_profit_loss = get_net_profit_loss(
-		income, expense, period_list, filters.company, filters.presentation_currency
+		income,
+		expense,
+		period_list,
+		filters.company,
+		filters.presentation_currency,
+		accumulated_values=bool(filters.accumulated_values),
 	)
 
 	data = []
@@ -244,7 +249,13 @@ def execute_snapshot_report(filters):
 	if net_profit_loss:
 		data.append(net_profit_loss)
 
-	columns = get_columns(filters.periodicity, period_list, filters.accumulated_values, filters.company)
+	columns = get_columns(
+		filters.periodicity,
+		period_list,
+		filters.accumulated_values,
+		filters.company,
+		selected_view=filters.get("selected_view"),
+	)
 
 	currency = filters.presentation_currency or frappe.get_cached_value(
 		"Company", filters.company, "default_currency"
@@ -259,7 +270,7 @@ def execute_snapshot_report(filters):
 		compute_growth_view_data(data, period_list)
 
 	if filters.get("selected_view") == "Margin":
-		compute_margin_view_data(data, period_list, filters.accumulated_values)
+		compute_margin_view_data(data, period_list)
 
 	return columns, data, None, chart, report_summary, primitive_summary
 
