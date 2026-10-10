@@ -33,6 +33,7 @@ def execute(filters=None):
 	if filters and filters.report_template:
 		return FinancialReportEngine().execute(filters)
 
+	_normalise_project_filter(filters)
 	period_list = build_period_list(filters)
 
 	if not period_list:
@@ -221,6 +222,29 @@ def get_chart_data(filters, chart_columns, income, expense, net_profit_loss, cur
 	return chart
 
 
+def _normalise_project_filter(filters):
+	if filters is None:
+		return
+
+	project = filters.get("project")
+	if project is None or project == "":
+		return
+
+	error = _("Project must be a list of non-empty project names")
+	if isinstance(project, str):
+		try:
+			project = frappe.parse_json(project)
+		except ValueError:
+			frappe.throw(error)
+
+	if not isinstance(project, list) or any(
+		not isinstance(name, str) or not name.strip() for name in project
+	):
+		frappe.throw(error)
+
+	filters.project = project
+
+
 def execute_snapshot_report(filters):
 	from frappe.database.duckdb.database import get_latest_sync
 
@@ -229,62 +253,70 @@ def execute_snapshot_report(filters):
 			_("Profit and Loss Statement requires {0} to be synced to DuckDB").format(frappe.bold("GL Entry"))
 		)
 
-	period_list = build_period_list(filters)
+	try:
+		_normalise_project_filter(filters)
+		period_list = build_period_list(filters)
+		if not period_list:
+			return
 
-	income = _get_data_duckdb(conn, filters, "Income", "Credit", period_list)
-	expense = _get_data_duckdb(conn, filters, "Expense", "Debit", period_list)
+		income = _get_data_duckdb(conn, filters, "Income", "Credit", period_list)
+		expense = _get_data_duckdb(conn, filters, "Expense", "Debit", period_list)
 
-	net_profit_loss = get_net_profit_loss(
-		income,
-		expense,
-		period_list,
-		filters.company,
-		filters.presentation_currency,
-		accumulated_values=bool(filters.accumulated_values),
-	)
+		net_profit_loss = get_net_profit_loss(
+			income,
+			expense,
+			period_list,
+			filters.company,
+			filters.presentation_currency,
+			accumulated_values=bool(filters.accumulated_values),
+		)
 
-	data = []
-	data.extend(income or [])
-	data.extend(expense or [])
-	if net_profit_loss:
-		data.append(net_profit_loss)
+		data = []
+		data.extend(income or [])
+		data.extend(expense or [])
+		if net_profit_loss:
+			data.append(net_profit_loss)
 
-	columns = get_columns(
-		filters.periodicity,
-		period_list,
-		filters.accumulated_values,
-		filters.company,
-		selected_view=filters.get("selected_view"),
-	)
+		columns = get_columns(
+			filters.periodicity,
+			period_list,
+			filters.accumulated_values,
+			filters.company,
+			selected_view=filters.get("selected_view"),
+		)
 
-	currency = filters.presentation_currency or frappe.get_cached_value(
-		"Company", filters.company, "default_currency"
-	)
-	chart = get_chart_data(filters, period_list, income, expense, net_profit_loss, currency)
+		currency = filters.presentation_currency or frappe.get_cached_value(
+			"Company", filters.company, "default_currency"
+		)
+		chart = get_chart_data(filters, period_list, income, expense, net_profit_loss, currency)
 
-	report_summary, primitive_summary = get_report_summary(
-		period_list, filters.periodicity, income, expense, net_profit_loss, currency, filters
-	)
+		report_summary, primitive_summary = get_report_summary(
+			period_list, filters.periodicity, income, expense, net_profit_loss, currency, filters
+		)
 
-	if filters.get("selected_view") == "Growth":
-		compute_growth_view_data(data, period_list)
+		if filters.get("selected_view") == "Growth":
+			compute_growth_view_data(data, period_list)
 
-	if filters.get("selected_view") == "Margin":
-		compute_margin_view_data(data, period_list)
+		if filters.get("selected_view") == "Margin":
+			compute_margin_view_data(data, period_list)
 
-	return columns, data, None, chart, report_summary, primitive_summary
+		return columns, data, None, chart, report_summary, primitive_summary
+	finally:
+		conn.close()
 
 
 def _get_data_duckdb(conn, filters, root_type, balance_must_be, period_list):
-	accounts = get_accounts(filters.company, root_type)
-	if not accounts:
+	all_accounts = get_accounts(filters.company, root_type)
+	if not all_accounts:
 		return None
 
-	accounts, accounts_by_name, parent_children_map = filter_accounts(accounts)
+	accounts, accounts_by_name, parent_children_map = filter_accounts(all_accounts)
 	company_currency = get_appropriate_currency(filters.company, filters)
 
 	gl_entries_by_account = {}
-	_load_gl_entries_duckdb(conn, filters, period_list, accounts, gl_entries_by_account)
+	_load_gl_entries_duckdb(
+		conn, filters, period_list, accounts, gl_entries_by_account, context_accounts=all_accounts
+	)
 
 	calculate_values(
 		accounts_by_name,
@@ -310,7 +342,10 @@ def _get_data_duckdb(conn, filters, root_type, balance_must_be, period_list):
 	return out
 
 
-def _load_gl_entries_duckdb(conn, filters, period_list, accounts, gl_entries_by_account):
+def _load_gl_entries_duckdb(
+	conn, filters, period_list, accounts, gl_entries_by_account, *, context_accounts=None
+):
+	from erpnext.accounts.doctype.accounting_dimension.accounting_dimension import get_dimension_fieldname
 	from erpnext.accounts.report.trial_balance.trial_balance import (
 		_extra_gl_conditions,
 		_fetch_gl_rows_duckdb,
@@ -319,7 +354,7 @@ def _load_gl_entries_duckdb(conn, filters, period_list, accounts, gl_entries_by_
 
 	company = filters.company
 	leaf_accounts = [acc.name for acc in accounts if not acc.is_group]
-	if not leaf_accounts:
+	if not leaf_accounts or not period_list:
 		return
 
 	extra_cond, extra_params = _extra_gl_conditions(filters)
@@ -327,20 +362,67 @@ def _load_gl_entries_duckdb(conn, filters, period_list, accounts, gl_entries_by_
 	base_conds = [
 		"company = ?",
 		"is_cancelled = 0",
-		f"account IN ({account_placeholders})",
 		"voucher_type != 'Period Closing Voucher'",
 	]
-	base_params = [company, *leaf_accounts]
+	base_params = [company]
 	base_conds.extend(extra_cond)
 	base_params.extend(extra_params)
 
+	dimension_field = None
+	if period_list and period_list[0].get("dimension_field"):
+		dimension_field = get_dimension_fieldname(filters.group_by_dimension)
+		if not dimension_field or dimension_field not in frappe.get_meta("GL Entry").get_valid_columns():
+			frappe.throw(_("Invalid accounting dimension for GL Entry"))
+
+	display_entries = []
 	for period in period_list:
-		period_conds = [*base_conds, "posting_date >= ?", "posting_date <= ?"]
-		period_params = [*base_params, period.from_date, period.to_date]
+		period_conds = [
+			*base_conds,
+			f"account IN ({account_placeholders})",
+			"posting_date >= ?",
+			"posting_date <= ?",
+		]
+		period_params = [*base_params, *leaf_accounts, period.from_date, period.to_date]
+		if period.get("dimension_field"):
+			if period.dimension_field != dimension_field:
+				frappe.throw(_("Invalid accounting dimension for GL Entry"))
+			quoted_dimension = dimension_field.replace('"', '""')
+			period_conds.append(f'"{quoted_dimension}" = ?')
+			period_params.append(period.dimension_value)
 
 		period_entries = _fetch_gl_rows_duckdb(conn, period_conds, period_params)
-		if filters.get("presentation_currency"):
-			convert_to_presentation_currency(period_entries, get_currency(filters))
 		for entry in period_entries:
+			if dimension_field:
+				entry[dimension_field] = period.dimension_value
 			entry.posting_date = period.to_date
-			gl_entries_by_account.setdefault(entry.account, []).append(entry)
+			display_entries.append(entry)
+
+	if filters.get("presentation_currency"):
+		context_accounts = accounts if context_accounts is None else context_accounts
+		roots = [acc for acc in context_accounts if not acc.parent_account]
+		root_by_account = {}
+		for acc in context_accounts:
+			if acc.is_group:
+				continue
+			matches = [root.name for root in roots if root.lft <= acc.lft and acc.rgt <= root.rgt]
+			if not matches and acc.name not in leaf_accounts:
+				continue
+			if len(matches) != 1:
+				frappe.throw(_("Could not determine a unique root account for {0}").format(acc.name))
+			root_by_account[acc.name] = matches[0]
+
+		context_placeholders = ", ".join(["?"] * len(root_by_account))
+		context_entries = _fetch_gl_rows_duckdb(
+			conn,
+			[*base_conds, f"account IN ({context_placeholders})", "posting_date >= ?", "posting_date <= ?"],
+			[*base_params, *root_by_account, period_list[0].year_start_date, period_list[-1].to_date],
+		)
+		entries_by_root = {root.name: [] for root in roots}
+		for entry in [*context_entries, *display_entries]:
+			entries_by_root[root_by_account[entry.account]].append(entry)
+		currency = get_currency(filters)
+		for entries in entries_by_root.values():
+			convert_to_presentation_currency(entries, currency)
+
+	for entry in display_entries:
+		gl_entries_by_account.setdefault(entry.account, []).append(entry)
