@@ -86,7 +86,7 @@ Object.assign(frappe.model, {
 		// update values in the existing local doc instead of replacing
 		let local_doc = locals[doc.doctype][doc.name];
 		let clear_keys = function (source, target) {
-			Object.keys(target).map((key) => {
+			Object.keys(target).forEach((key) => {
 				if (source[key] == undefined) delete target[key];
 			});
 		};
