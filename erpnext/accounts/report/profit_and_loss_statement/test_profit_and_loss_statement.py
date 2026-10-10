@@ -50,6 +50,20 @@ def _insert_snapshot_currency_rows(conn, rows):
 		)
 
 
+def _snapshot_currency_accounts(separate_roots):
+	accounts = [
+		frappe._dict(name="Income Root", is_group=True, parent_account=None, lft=1, rgt=6),
+		frappe._dict(name="Foreign Income", is_group=False, parent_account="Income Root", lft=2, rgt=3),
+		frappe._dict(name="Local Income", is_group=False, parent_account="Income Root", lft=4, rgt=5),
+	]
+	if separate_roots:
+		accounts[0].rgt = 4
+		accounts[2].update(parent_account="Other Root", lft=6, rgt=7)
+		accounts.append(frappe._dict(name="Other Root", is_group=True, parent_account=None, lft=5, rgt=8))
+	accounts.sort(key=lambda account: account.lft)
+	return accounts
+
+
 def _depth_income_accounts(hidden_outside_root):
 	accounts = [
 		frappe._dict(name="Income Root", is_group=True, parent_account=None, lft=1, rgt=48),
@@ -236,16 +250,7 @@ class TestProfitAndLossStatement(ERPNextTestSuite, AccountsTestMixin):
 			group_by_dimension="Cost Center" if grouped else None,
 			project=project,
 		)
-		accounts = [
-			frappe._dict(name="Income Root", is_group=True, parent_account=None, lft=1, rgt=6),
-			frappe._dict(name="Foreign Income", is_group=False, parent_account="Income Root", lft=2, rgt=3),
-			frappe._dict(name="Local Income", is_group=False, parent_account="Income Root", lft=4, rgt=5),
-		]
-		if separate_roots:
-			accounts[0].rgt = 4
-			accounts[2].update(parent_account="Other Root", lft=6, rgt=7)
-			accounts.append(frappe._dict(name="Other Root", is_group=True, parent_account=None, lft=5, rgt=8))
-		accounts.sort(key=lambda account: account.lft)
+		accounts = _snapshot_currency_accounts(separate_roots)
 		with (
 			duckdb.connect(":memory:") as conn,
 			patch.object(report_utils, "get_company_currency", return_value="AUD"),
