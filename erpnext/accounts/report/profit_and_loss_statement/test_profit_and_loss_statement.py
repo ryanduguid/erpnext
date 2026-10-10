@@ -23,6 +23,86 @@ from erpnext.accounts.test.accounts_mixin import AccountsTestMixin
 from erpnext.tests.utils import ERPNextTestSuite
 
 
+def _create_snapshot_gl_table(conn):
+	conn.execute(
+		'CREATE TABLE "tabGL Entry" (company VARCHAR, is_cancelled INTEGER, account VARCHAR, '
+		"voucher_type VARCHAR, posting_date DATE, debit DOUBLE, credit DOUBLE, "
+		"debit_in_account_currency DOUBLE, credit_in_account_currency DOUBLE, "
+		"account_currency VARCHAR, cost_center VARCHAR, project VARCHAR, finance_book VARCHAR)"
+	)
+
+
+def _insert_snapshot_currency_rows(conn, rows):
+	for day, account, credit, account_credit, account_currency, dimension in rows:
+		conn.execute(
+			'INSERT INTO "tabGL Entry" VALUES (?, 0, ?, ?, ?, 0, ?, 0, ?, ?, ?, ?, NULL)',
+			[
+				"Snapshot Test",
+				account,
+				"Journal Entry",
+				day,
+				credit,
+				account_credit,
+				account_currency,
+				dimension,
+				dimension,
+			],
+		)
+
+
+def _depth_income_accounts(hidden_outside_root):
+	accounts = [
+		frappe._dict(name="Income Root", is_group=True, parent_account=None, lft=1, rgt=48),
+		frappe._dict(name="Foreign Income", is_group=False, parent_account="Income Root", lft=2, rgt=3),
+	]
+	parent = "Income Root"
+	for level in range(1, 22):
+		name = f"Depth {level}"
+		accounts.append(
+			frappe._dict(name=name, is_group=True, parent_account=parent, lft=3 + level, rgt=48 - level)
+		)
+		parent = name
+	accounts.append(
+		frappe._dict(
+			name="Hidden Income",
+			is_group=False,
+			parent_account=parent,
+			lft=100 if hidden_outside_root else 25,
+			rgt=101 if hidden_outside_root else 26,
+		)
+	)
+	for account in accounts:
+		account.account_name = account.name
+		account.root_type = "Income"
+		account.report_type = "Profit and Loss"
+	return accounts
+
+
+def _seed_snapshot_gl_rows(conn):
+	rows = [
+		("2026-01-15", 60, "A"),
+		("2026-01-16", 40, "A"),
+		("2026-02-15", 200, "A"),
+		("2026-01-15", 50, "B's Center"),
+		("2026-02-15", 75, "B's Center"),
+	]
+	_insert_snapshot_currency_rows(
+		conn, [(day, "Income", amount, amount, "AUD", value) for day, amount, value in rows]
+	)
+	for company, cancelled, account, voucher, day in (
+		("Other Company", 0, "Income", "Journal Entry", "2026-01-15"),
+		("Snapshot Test", 1, "Income", "Journal Entry", "2026-01-15"),
+		("Snapshot Test", 0, "Unrelated", "Journal Entry", "2026-01-15"),
+		("Snapshot Test", 0, "Income", "Period Closing Voucher", "2026-01-15"),
+		("Snapshot Test", 0, "Income", "Journal Entry", "2025-12-31"),
+		("Snapshot Test", 0, "Income", "Journal Entry", "2026-03-01"),
+	):
+		conn.execute(
+			'INSERT INTO "tabGL Entry" VALUES (?, ?, ?, ?, ?, 0, 1000, 0, 1000, ?, ?, ?, NULL)',
+			[company, cancelled, account, voucher, day, "AUD", "A", "A"],
+		)
+
+
 class TestProfitAndLossStatement(ERPNextTestSuite, AccountsTestMixin):
 	def test_project_selection_is_normalised_before_period_construction(self):
 		cases = (
@@ -171,27 +251,8 @@ class TestProfitAndLossStatement(ERPNextTestSuite, AccountsTestMixin):
 			patch.object(report_utils, "get_company_currency", return_value="AUD"),
 			patch.object(report_utils, "get_rate_as_at", return_value=2) as rate,
 		):
-			conn.execute(
-				'CREATE TABLE "tabGL Entry" (company VARCHAR, is_cancelled INTEGER, account VARCHAR, '
-				"voucher_type VARCHAR, posting_date DATE, debit DOUBLE, credit DOUBLE, "
-				"debit_in_account_currency DOUBLE, credit_in_account_currency DOUBLE, "
-				"account_currency VARCHAR, cost_center VARCHAR, project VARCHAR, finance_book VARCHAR)"
-			)
-			for day, account, credit, account_credit, account_currency, dimension in rows:
-				conn.execute(
-					'INSERT INTO "tabGL Entry" VALUES (?, 0, ?, ?, ?, 0, ?, 0, ?, ?, ?, ?, NULL)',
-					[
-						"Snapshot Test",
-						account,
-						"Journal Entry",
-						day,
-						credit,
-						account_credit,
-						account_currency,
-						dimension,
-						dimension,
-					],
-				)
+			_create_snapshot_gl_table(conn)
+			_insert_snapshot_currency_rows(conn, rows)
 			entries = {}
 			report._load_gl_entries_duckdb(conn, filters, periods, accounts, entries)
 			if currency:
@@ -261,34 +322,7 @@ class TestProfitAndLossStatement(ERPNextTestSuite, AccountsTestMixin):
 			(False, None, 100),
 		):
 			with self.subTest(hidden_outside_root=hidden_outside_root, currency=currency):
-				accounts = [
-					frappe._dict(name="Income Root", is_group=True, parent_account=None, lft=1, rgt=48),
-					frappe._dict(
-						name="Foreign Income", is_group=False, parent_account="Income Root", lft=2, rgt=3
-					),
-				]
-				parent = "Income Root"
-				for level in range(1, 22):
-					name = f"Depth {level}"
-					accounts.append(
-						frappe._dict(
-							name=name, is_group=True, parent_account=parent, lft=3 + level, rgt=48 - level
-						)
-					)
-					parent = name
-				accounts.append(
-					frappe._dict(
-						name="Hidden Income",
-						is_group=False,
-						parent_account=parent,
-						lft=100 if hidden_outside_root else 25,
-						rgt=101 if hidden_outside_root else 26,
-					)
-				)
-				for account in accounts:
-					account.account_name = account.name
-					account.root_type = "Income"
-					account.report_type = "Profit and Loss"
+				accounts = _depth_income_accounts(hidden_outside_root)
 				period = frappe._dict(
 					key="jan",
 					from_date=getdate("2026-01-01"),
@@ -311,28 +345,14 @@ class TestProfitAndLossStatement(ERPNextTestSuite, AccountsTestMixin):
 					patch.object(report_utils, "get_rate_as_at", return_value=2),
 					patch.object(report, "calculate_values", wraps=report.calculate_values) as calculate,
 				):
-					conn.execute(
-						'CREATE TABLE "tabGL Entry" (company VARCHAR, is_cancelled INTEGER, account VARCHAR, '
-						"voucher_type VARCHAR, posting_date DATE, debit DOUBLE, credit DOUBLE, "
-						"debit_in_account_currency DOUBLE, credit_in_account_currency DOUBLE, "
-						"account_currency VARCHAR, finance_book VARCHAR)"
+					_create_snapshot_gl_table(conn)
+					_insert_snapshot_currency_rows(
+						conn,
+						[
+							("2026-01-15", "Foreign Income", 100, 90, "USD", None),
+							("2026-01-15", "Hidden Income", 200, 200, "AUD", None),
+						],
 					)
-					for name, amount, account_amount, account_currency in (
-						("Foreign Income", 100, 90, "USD"),
-						("Hidden Income", 200, 200, "AUD"),
-					):
-						conn.execute(
-							'INSERT INTO "tabGL Entry" VALUES (?, 0, ?, ?, ?, 0, ?, 0, ?, ?, NULL)',
-							[
-								"Snapshot Test",
-								name,
-								"Journal Entry",
-								"2026-01-15",
-								amount,
-								account_amount,
-								account_currency,
-							],
-						)
 					result = report._get_data_duckdb(conn, filters, "Income", "Credit", [period])
 				self.assertEqual({"Foreign Income"}, set(calculate.call_args.args[1]))
 				self.assertNotIn("Hidden Income", {row.get("account") for row in result})
@@ -363,36 +383,8 @@ class TestProfitAndLossStatement(ERPNextTestSuite, AccountsTestMixin):
 			project=selected_project,
 		)
 		with duckdb.connect(":memory:") as conn:
-			conn.execute(
-				'CREATE TABLE "tabGL Entry" (company VARCHAR, is_cancelled INTEGER, account VARCHAR, '
-				"voucher_type VARCHAR, posting_date DATE, debit DOUBLE, credit DOUBLE, "
-				"debit_in_account_currency DOUBLE, credit_in_account_currency DOUBLE, "
-				"account_currency VARCHAR, cost_center VARCHAR, project VARCHAR, finance_book VARCHAR)"
-			)
-			rows = [
-				("2026-01-15", 60, "A"),
-				("2026-01-16", 40, "A"),
-				("2026-02-15", 200, "A"),
-				("2026-01-15", 50, "B's Center"),
-				("2026-02-15", 75, "B's Center"),
-			]
-			for day, amount, value in rows:
-				conn.execute(
-					'INSERT INTO "tabGL Entry" VALUES (?, 0, ?, ?, ?, 0, ?, 0, ?, ?, ?, ?, NULL)',
-					["Snapshot Test", "Income", "Journal Entry", day, amount, amount, "AUD", value, value],
-				)
-			for company, cancelled, account, voucher, day in (
-				("Other Company", 0, "Income", "Journal Entry", "2026-01-15"),
-				("Snapshot Test", 1, "Income", "Journal Entry", "2026-01-15"),
-				("Snapshot Test", 0, "Unrelated", "Journal Entry", "2026-01-15"),
-				("Snapshot Test", 0, "Income", "Period Closing Voucher", "2026-01-15"),
-				("Snapshot Test", 0, "Income", "Journal Entry", "2025-12-31"),
-				("Snapshot Test", 0, "Income", "Journal Entry", "2026-03-01"),
-			):
-				conn.execute(
-					'INSERT INTO "tabGL Entry" VALUES (?, ?, ?, ?, ?, 0, 1000, 0, 1000, ?, ?, ?, NULL)',
-					[company, cancelled, account, voucher, day, "AUD", "A", "A"],
-				)
+			_create_snapshot_gl_table(conn)
+			_seed_snapshot_gl_rows(conn)
 			entries = {}
 			report._load_gl_entries_duckdb(
 				conn, filters, periods, [frappe._dict(name="Income", is_group=False)], entries

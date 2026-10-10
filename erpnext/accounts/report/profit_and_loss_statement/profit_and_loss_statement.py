@@ -345,12 +345,7 @@ def _get_data_duckdb(conn, filters, root_type, balance_must_be, period_list):
 def _load_gl_entries_duckdb(
 	conn, filters, period_list, accounts, gl_entries_by_account, *, context_accounts=None
 ):
-	from erpnext.accounts.doctype.accounting_dimension.accounting_dimension import get_dimension_fieldname
-	from erpnext.accounts.report.trial_balance.trial_balance import (
-		_extra_gl_conditions,
-		_fetch_gl_rows_duckdb,
-	)
-	from erpnext.accounts.report.utils import convert_to_presentation_currency, get_currency
+	from erpnext.accounts.report.trial_balance.trial_balance import _extra_gl_conditions
 
 	company = filters.company
 	leaf_accounts = [acc.name for acc in accounts if not acc.is_group]
@@ -358,7 +353,6 @@ def _load_gl_entries_duckdb(
 		return
 
 	extra_cond, extra_params = _extra_gl_conditions(filters)
-	account_placeholders = ", ".join(["?"] * len(leaf_accounts))
 	base_conds = [
 		"company = ?",
 		"is_cancelled = 0",
@@ -368,6 +362,31 @@ def _load_gl_entries_duckdb(
 	base_conds.extend(extra_cond)
 	base_params.extend(extra_params)
 
+	display_entries = _get_snapshot_period_entries(
+		conn, filters, period_list, leaf_accounts, base_conds, base_params
+	)
+	if filters.get("presentation_currency"):
+		context_accounts = accounts if context_accounts is None else context_accounts
+		_convert_snapshot_entries(
+			conn,
+			filters,
+			period_list,
+			context_accounts,
+			leaf_accounts,
+			base_conds,
+			base_params,
+			display_entries,
+		)
+
+	for entry in display_entries:
+		gl_entries_by_account.setdefault(entry.account, []).append(entry)
+
+
+def _get_snapshot_period_entries(conn, filters, period_list, leaf_accounts, base_conds, base_params):
+	from erpnext.accounts.doctype.accounting_dimension.accounting_dimension import get_dimension_fieldname
+	from erpnext.accounts.report.trial_balance.trial_balance import _fetch_gl_rows_duckdb
+
+	account_placeholders = ", ".join(["?"] * len(leaf_accounts))
 	dimension_field = None
 	if period_list and period_list[0].get("dimension_field"):
 		dimension_field = get_dimension_fieldname(filters.group_by_dimension)
@@ -396,33 +415,40 @@ def _load_gl_entries_duckdb(
 				entry[dimension_field] = period.dimension_value
 			entry.posting_date = period.to_date
 			display_entries.append(entry)
+	return display_entries
 
-	if filters.get("presentation_currency"):
-		context_accounts = accounts if context_accounts is None else context_accounts
-		roots = [acc for acc in context_accounts if not acc.parent_account]
-		root_by_account = {}
-		for acc in context_accounts:
-			if acc.is_group:
-				continue
-			matches = [root.name for root in roots if root.lft <= acc.lft and acc.rgt <= root.rgt]
-			if not matches and acc.name not in leaf_accounts:
-				continue
-			if len(matches) != 1:
-				frappe.throw(_("Could not determine a unique root account for {0}").format(acc.name))
-			root_by_account[acc.name] = matches[0]
 
-		context_placeholders = ", ".join(["?"] * len(root_by_account))
-		context_entries = _fetch_gl_rows_duckdb(
-			conn,
-			[*base_conds, f"account IN ({context_placeholders})", "posting_date >= ?", "posting_date <= ?"],
-			[*base_params, *root_by_account, period_list[0].year_start_date, period_list[-1].to_date],
-		)
-		entries_by_root = {root.name: [] for root in roots}
-		for entry in [*context_entries, *display_entries]:
-			entries_by_root[root_by_account[entry.account]].append(entry)
-		currency = get_currency(filters)
-		for entries in entries_by_root.values():
-			convert_to_presentation_currency(entries, currency)
+def _get_snapshot_root_accounts(context_accounts, leaf_accounts):
+	roots = [acc for acc in context_accounts if not acc.parent_account]
+	root_by_account = {}
+	for acc in context_accounts:
+		if acc.is_group:
+			continue
+		matches = [root.name for root in roots if root.lft <= acc.lft and acc.rgt <= root.rgt]
+		if not matches and acc.name not in leaf_accounts:
+			continue
+		if len(matches) != 1:
+			frappe.throw(_("Could not determine a unique root account for {0}").format(acc.name))
+		root_by_account[acc.name] = matches[0]
+	return roots, root_by_account
 
-	for entry in display_entries:
-		gl_entries_by_account.setdefault(entry.account, []).append(entry)
+
+def _convert_snapshot_entries(
+	conn, filters, period_list, context_accounts, leaf_accounts, base_conds, base_params, display_entries
+):
+	from erpnext.accounts.report.trial_balance.trial_balance import _fetch_gl_rows_duckdb
+	from erpnext.accounts.report.utils import convert_to_presentation_currency, get_currency
+
+	roots, root_by_account = _get_snapshot_root_accounts(context_accounts, leaf_accounts)
+	context_placeholders = ", ".join(["?"] * len(root_by_account))
+	context_entries = _fetch_gl_rows_duckdb(
+		conn,
+		[*base_conds, f"account IN ({context_placeholders})", "posting_date >= ?", "posting_date <= ?"],
+		[*base_params, *root_by_account, period_list[0].year_start_date, period_list[-1].to_date],
+	)
+	entries_by_root = {root.name: [] for root in roots}
+	for entry in [*context_entries, *display_entries]:
+		entries_by_root[root_by_account[entry.account]].append(entry)
+	currency = get_currency(filters)
+	for entries in entries_by_root.values():
+		convert_to_presentation_currency(entries, currency)
